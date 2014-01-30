@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-
+try:
+    import ujson as json
+except ImportError:
+    import json
 import uuid
-#import bson
-
-import json
-from datetime import datetime
-import decimal
 
 class JsonRpcServerError(Exception):
     # -32099 to -32000 free for application-defined codes
@@ -30,128 +28,183 @@ class JsonRpcMethodNotFoundError(JsonRpcServerError):
 class JsonRpcInvalidRequestError(JsonRpcServerError):
     code = -32600
     message = 'Invalid Request'
-    
+
 class JsonRpcTooBigError(JsonRpcInvalidRequestError):
     message = 'Message too big'
 
 class JsonRpcParseError(JsonRpcServerError):
     code = -32700
     message = 'Parse error'
-    
+
 class JsonRpcClientError(JsonRpcServerError):
     code = -32000
     message = 'Server error'
 
-class JsonRpcEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-            
-        elif isinstance(obj, uuid.UUID):
-            return obj.__str__()
-            
-        elif hasattr(obj, "wrap"):
-            return obj.wrap()
-            
-#        elif isinstance(obj, bson.ObjectId):
-#            return obj.__str__()
-            
-        elif isinstance(obj, decimal.Decimal):
-            return float(obj)
-            
-#        elif isinstance(obj, IPAddress): # or isinstance(obj, PhoneNumber) or isinstance(obj, EncryptedString):
-#            return str(obj)
+import schematics
+from schematics import models
+from schematics.types import ( UUIDType, IntType, StringType, BaseType )
+from schematics.types.compound import ( ListType, DictType, ModelType )
 
-        raise TypeError("%r is not JSON serializable" % (obj,))
-
-def dump_request(method, params, req_id=None, encoder=JsonRpcEncoder, indent=None):
-    """ """
-    req_id = req_id or uuid.uuid4().__str__()
-    obj = {"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}
-    return json.dumps(obj, cls=encoder, indent=indent)
-
-def dump_response(result, req_id=None, encoder=JsonRpcEncoder, indent=None):
-    """ """
-    obj = {"jsonrpc": "2.0", "result": result, "id": req_id}
-    return json.dumps(obj, cls=encoder, indent=indent)
-
-def dump_error(error, req_id=None, encoder=JsonRpcEncoder):
-    _err = {'code': None, 'message':None}
-    if isinstance(error, dict):
-        error.has_key('code') and _err.update({'code': error['code']})
-        error.has_key('message') and _err.update({'message': error['message']})
-    obj = {"jsonrpc": "2.0", "error": _err, "id": req_id}
-    return json.dumps(obj, cls=encoder)
-
-def load_string(string):
-#    return json.loads(string, parse_float=decimal.Decimal)
-    return json.loads(string)
-
-class Request(object):
-    """ 
+#class ValidateError(schematics.exceptions.ModelValidationError):
+#    pass
     
-    """
-    keys = ('jsonrpc', 'id', 'method', 'params')
+ValidateError = schematics.exceptions.ModelValidationError
+
+class ErrResponse(models.Model):
+    code = IntType(required=False, serialize_when_none=False)
+    message = StringType(required=False, serialize_when_none=False)
+
+class ResponseModel(models.Model):
+    ''' JSON-RPC response model '''
+    jsonrpc = StringType(required=True, default='2.0')
+    id = StringType(required=False)
+    result = BaseType(required=False, serialize_when_none=False)
+    error = ModelType(ErrResponse, default=ErrResponse(), required=False, serialize_when_none=False)
+
+class RequestModel(models.Model):
+    ''' JSON-RPC request model '''
+    jsonrpc = StringType(required=True, default='2.0')
+    id = StringType(required=False)
+    method = StringType(required=True)
+    params = BaseType(required=False)
+
+class Response(ResponseModel):
+    ''' JSON-RPC Response '''
     
-    def __init__(self, method=None, params=None, id=None, jsonrpc=None):
-        """ """
-        # set default
-        map(lambda key: setattr(self, key, None), self.keys)
-        # set by arguments
-        method and setattr(self, 'method', method)
-        params and setattr(self, 'params', params)
-        setattr(self, 'id', id or uuid.uuid4().__str__()) 
-        setattr(self, 'jsonrpc', jsonrpc or '2.0') 
+    def __str__(self):
+        return '%s: %s' % (Response.__name__, self.to_json())
+        
+    def to_json(self):
+        return json.dumps(self.to_primitive())
+    
+    @classmethod
+    def from_json(cls, jsonstring):
+        ''' parse response jsonstring '''
+        
+        data = {}
+        
+        def parser(jsonstring):
+            try:
+                data = json.loads(jsonstring)
+                
+            except ValueError:
+                raise JsonRpcParseError()
+                
+            finally:
+                return data
+
+        data = parser(jsonstring)
+        Resp = cls(data)
+        return Resp
+
+class Request(RequestModel):
+    ''' JSON-RPC request model '''
+        
+    @classmethod
+    def from_json(cls, jsonstring):
+        ''' parse request jsonstring '''
+        
+        data = {}
+        
+        def parser(jsonstring):
+            try:
+                data = json.loads(jsonstring)
+            except ValueError:
+                raise JsonRpcParseError()
+            else:
+                return data
+        try:
+            data = parser(jsonstring)
+            
+            if not 'method' in data or not data['method']:
+                raise JsonRpcInvalidRequestError()
+
+            if 'params' in data:
+                if isinstance(data['params'], dict):
+                    class Request(cls):
+                        params = DictType(BaseType)
+                    Req = Request(data)
+                    
+                elif isinstance(data['params'], list or tuple):
+                    class Request(cls):
+                        params = ListType(BaseType)
+                    Req = Request(data)
+                    
+                else:
+                    raise JsonRpcInvalidParamsError()
+            else:
+                Req = cls(data)
+
+        except (
+                JsonRpcParseError, 
+                JsonRpcInvalidParamsError, 
+                JsonRpcInvalidRequestError
+        ), ex:
+            Req = cls(data)
+            Req.Response.error = {'code': ex.code, 'message': ex.message}
+            Req.Response.id = data.get('id')
+            return Req
+
+        finally:
+            return Req
 
     def __str__(self):
-        return '%s: %s' % (self.__class__.__name__, self.__dict__)
+        return '%s: %s' % (Request.__name__, self.to_json())
 
-    def json(self, indent=None):
-        return dump_request(self.method, self.params, req_id=self.id, indent=indent)
+    def __repr__(self):
+        return self.to_json()
 
-#    def sha256(self):
-#        return sha256('%s:%s' % (str(self.method), str(sorted(self.params))))
+    def to_json(self):
+        return json.dumps(self.to_primitive())
 
-    @classmethod
-    def unwrap(cls, req):
-        try:
-            req_data = load_string(req)
-            Req = Request(**req_data)
-            return Req
-        except ValueError:
-            raise JsonRpcParseError()
+    def is_valid(self):
+        if self.Response.error.to_native():
+            return False
+        return True
+        
+    def __init__(self, *args, **kwargs):
+        super(Request, self).__init__(*args, **kwargs)
+        
+        # set id
+        not self.id and setattr(self, 'id', uuid.uuid4().__str__())
+        
+        # set Response
+        self.Response = Response()
+        self.Response.id = self.id
 
-class Response(object):
-    ''' jsonrpc response object '''
+
+if __name__ == '__main__':
+    ''' '''
     
-    def __init__(self, result=None, id=None, error=None, jsonrpc='2.0'):
-        ''' '''
-        self.result = result
-        self.id = id
-        self.error = error
-        self.jsonrpc = jsonrpc
+    reqstring = {
+        'jsonrpc':'2.0', 
+        'id': '73555b67-a3ca-4987-b944-4d5458863500', 
+        'method': 'Resource::Add', 
+        'params': {'hostname':'sex.ua'}
+    }
     
-    def __eq__(self, req_id):
-        return str(self.id) == str(req_id)
+    jsonstring = json.dumps(reqstring)
     
-    def json(self):
-        ''' response to json '''
-        if not self.error:
-            return dump_response(self.result, req_id=self.id)
-        else:
-            return dump_error(self.error, req_id=self.id)
-
-    @classmethod
-    def unwrap(cls, res):
-        ''' unwrap json string '''
-        try:
-            res_data = load_string(res)
-            Res = cls(**res_data)
-            return Res
-        except ValueError:
-            raise JsonRpcParseError()
-
-if __name__ == "__main__":
-    """ """
+    jsonstring = '>>>'
     
-
+    Req = Request.from_json(jsonstring)
+    print Req.method
+    print Req.is_valid()
+    
+    print Req.Response
+    
+    
+    
+#    Req = Request()
+#    Req.method = 'Resource::Add'
+#    
+#    
+#    print Req.to_native()
+#    print Req.to_primitive()
+#    print dir(Req)
+#    
+#    print Req
+    
+    
+    
+    
